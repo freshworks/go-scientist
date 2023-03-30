@@ -1,9 +1,11 @@
 package scientist
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"reflect"
+	"runtime/debug"
 )
 
 var ErrorOnMismatches bool
@@ -23,7 +25,7 @@ func New(name string) *Experiment {
 	}
 }
 
-type behaviorFunc func() (value interface{}, err error)
+type behaviorFunc func(ctx context.Context) (value interface{}, err error)
 
 type Experiment struct {
 	Name              string
@@ -39,15 +41,15 @@ type Experiment struct {
 	cleaner           func(interface{}) (interface{}, error)
 }
 
-func (e *Experiment) Use(fn func() (interface{}, error)) {
+func (e *Experiment) Use(fn func(ctx context.Context) (interface{}, error)) {
 	e.Behavior(controlBehavior, fn)
 }
 
-func (e *Experiment) Try(fn func() (interface{}, error)) {
+func (e *Experiment) Try(fn func(ctx context.Context) (interface{}, error)) {
 	e.Behavior(candidateBehavior, fn)
 }
 
-func (e *Experiment) Behavior(name string, fn func() (interface{}, error)) {
+func (e *Experiment) Behavior(name string, fn func(ctx context.Context) (interface{}, error)) {
 	e.behaviors[name] = fn
 }
 
@@ -79,11 +81,36 @@ func (e *Experiment) ReportErrors(fn func(...ResultError)) {
 	e.errorReporter = fn
 }
 
-func (e *Experiment) Run() (interface{}, error) {
-	return e.RunBehavior(controlBehavior)
+func (e *Experiment) Run(ctx context.Context) (interface{}, error) {
+	defer func() {
+		err := recover()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[scientist] stacktrace from unhandled exception:%v Stacktrace: %s", err, string(debug.Stack()))
+		}
+	}()
+	return e.RunBehavior(ctx, controlBehavior, false, false)
 }
 
-func (e *Experiment) RunBehavior(name string) (interface{}, error) {
+func (e *Experiment) RunAsync(ctx context.Context) (interface{}, error) {
+	defer func() {
+		err := recover()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[scientist] stacktrace from unhandled exception:%v Stacktrace: %s", err, string(debug.Stack()))
+		}
+	}()
+	return e.RunBehavior(ctx, controlBehavior, true, false)
+}
+
+func (e *Experiment) RunAsyncCandidatesOnly(ctx context.Context) (interface{}, error) {
+	defer func() {
+		err := recover()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[scientist] stacktrace from unhandled exception:%v Stacktrace: %s", err, string(debug.Stack()))
+		}
+	}()
+	return e.RunBehavior(ctx, controlBehavior, false, true)
+}
+func (e *Experiment) RunBehavior(ctx context.Context, controlBehavior string, async, runCandidatesOnlyAsAsync bool) (interface{}, error) {
 	enabled, err := e.runcheck()
 	if err != nil {
 		enabled = true
@@ -92,7 +119,14 @@ func (e *Experiment) RunBehavior(name string) (interface{}, error) {
 	}
 
 	if enabled && len(e.behaviors) > 1 {
-		r := Run(e, name)
+		var r Result
+		if runCandidatesOnlyAsAsync {
+			r = RunAsyncCandidatesOnly(ctx, e, controlBehavior)
+		} else if async {
+			r = RunAsync(ctx, e, controlBehavior)
+		} else {
+			r = Run(ctx, e, controlBehavior)
+		}
 
 		if r.Control.Err == nil && e.ErrorOnMismatches && r.IsMismatched() {
 			return nil, MismatchError{r}
@@ -101,12 +135,12 @@ func (e *Experiment) RunBehavior(name string) (interface{}, error) {
 		return r.Control.Value, r.Control.Err
 	}
 
-	behavior, ok := e.behaviors[name]
+	behavior, ok := e.behaviors[controlBehavior]
 	if !ok {
-		return nil, behaviorNotFound(e, name)
+		return nil, behaviorNotFound(e, controlBehavior)
 	}
 
-	return behavior()
+	return behavior(ctx)
 }
 
 func (e *Experiment) resultErr(name string, err error) ResultError {
